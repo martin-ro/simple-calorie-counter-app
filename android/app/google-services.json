@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "1061807776510",
+    "project_id": "simple-calorie-tracker-7a1c7",
+    "storage_bucket": "simple-calorie-tracker-7a1c7.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1061807776510:android:ab61bf40ee404181bafbaf",
+        "android_client_info": {
+          "package_name": "com.simple.calorietracker"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC4o20wkWTBrNBTV7zMouw_CXq_fYUe64c"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
