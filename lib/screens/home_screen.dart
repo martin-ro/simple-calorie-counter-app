@@ -6,8 +6,11 @@ import '../models/food_entry.dart';
 import '../models/meal.dart';
 import '../models/weight_entry.dart';
 import '../services/auth_service.dart';
+import '../services/health_service.dart';
 import '../services/storage_service.dart';
+import '../widgets/app_card.dart';
 import 'add_food_screen.dart';
+import 'calories_detail_screen.dart';
 import 'settings_screen.dart';
 
 /// The main screen of the calorie tracker app.
@@ -27,14 +30,32 @@ class _HomeScreenState extends State<HomeScreen> {
   // All food entries (not just today's - we store everything)
   List<FoodEntry> _entries = [];
 
-  // User's calorie budget from profile
+  // User's calorie budget from profile (default/fallback)
   int _calorieBudget = 2000; // Default fallback
+
+  // Budget history (sorted by effectiveDate descending)
+  List<Map<String, dynamic>> _budgetHistory = [];
+
+  // Meal budgets (value and isPercent for each meal)
+  Map<String, Map<String, dynamic>> _mealBudgets = {};
 
   // Service for saving/loading data
   final StorageService _storage = StorageService();
 
   // Service for authentication
   final AuthService _authService = AuthService();
+
+  // Service for health data (Health Connect / HealthKit)
+  final HealthService _healthService = HealthService();
+
+  // Exercise calories burned (from health data)
+  int _exerciseCalories = 0;
+
+  // Cached exercise data from Firestore (keyed by YYYY-MM-DD)
+  Map<String, Map<String, dynamic>> _exerciseCache = {};
+
+  // Whether we've already synced historical health data this session
+  bool _hasInitialSynced = false;
 
   // Loading state for initial data load
   bool _isLoading = true;
@@ -90,12 +111,25 @@ class _HomeScreenState extends State<HomeScreen> {
     final entries = await _storage.loadEntries();
     final profile = await _storage.loadProfile();
     final weights = await _storage.loadWeights();
+    final budgetHistory = await _storage.loadBudgetHistory();
+
+    // Load health data if permissions granted
+    await _loadHealthData();
 
     setState(() {
       _entries = entries;
       _weights = weights;
+      _budgetHistory = budgetHistory;
       if (profile != null && profile['calorieBudget'] != null) {
         _calorieBudget = profile['calorieBudget'] as int;
+      }
+      // Load meal budgets
+      if (profile != null && profile['mealBudgets'] != null) {
+        _mealBudgets = Map<String, Map<String, dynamic>>.from(
+          (profile['mealBudgets'] as Map).map(
+            (key, value) => MapEntry(key as String, Map<String, dynamic>.from(value as Map)),
+          ),
+        );
       }
       _weekStartDay = profile?['weekStart'] as String? ?? 'monday';
       _useMetric = profile?['useMetric'] as bool? ?? true;
@@ -109,6 +143,236 @@ class _HomeScreenState extends State<HomeScreen> {
       }
       _isLoading = false;
     });
+  }
+
+  /// Loads exercise calorie data from Firestore cache or Health Connect
+  Future<void> _loadHealthData() async {
+    final hasPermissions = await _healthService.hasPermissions();
+    if (!hasPermissions) {
+      setState(() {
+        _exerciseCalories = 0;
+      });
+      return;
+    }
+
+    // Load cached data from Firestore
+    if (_exerciseCache.isEmpty) {
+      _exerciseCache = await _storage.loadAllExerciseData();
+    }
+
+    // Get exercise data for selected date from cache
+    final dateId = _dateToId(_selectedDate);
+    final cached = _exerciseCache[dateId];
+    if (cached != null) {
+      setState(() {
+        _exerciseCalories = cached['activeCalories'] as int? ?? 0;
+      });
+    } else {
+      setState(() {
+        _exerciseCalories = 0;
+      });
+    }
+
+    // Sync historical data in background on first load only
+    if (!_hasInitialSynced) {
+      _hasInitialSynced = true;
+      _syncHistoricalHealthData();
+    }
+  }
+
+  /// Handles pull-to-refresh - syncs health data from Health Connect
+  Future<void> _onRefresh() async {
+    final hasPermissions = await _healthService.hasPermissions();
+    if (!hasPermissions) return;
+
+    // Sync today's data from Health Connect
+    final today = DateTime.now();
+    final startOfDay = DateTime(today.year, today.month, today.day);
+
+    final newData = await _healthService.syncHistoricalData(
+      startDate: startOfDay,
+      existingDates: {}, // Empty set to force refresh
+    );
+
+    if (newData.isNotEmpty) {
+      // Save to Firestore
+      final batch = newData
+          .map((data) => {
+                'date': data.date.toIso8601String(),
+                'activeCalories': data.activeCalories,
+                'basalCalories': data.basalCalories,
+              })
+          .toList();
+
+      await _storage.saveExerciseDataBatch(batch);
+
+      // Update cache
+      for (final data in newData) {
+        final dateId = _dateToId(data.date);
+        _exerciseCache[dateId] = {
+          'date': data.date.toIso8601String(),
+          'activeCalories': data.activeCalories,
+          'basalCalories': data.basalCalories,
+        };
+      }
+
+      // Update display for selected date
+      final selectedDateId = _dateToId(_selectedDate);
+      final selectedData = _exerciseCache[selectedDateId];
+      if (selectedData != null && mounted) {
+        setState(() {
+          _exerciseCalories = selectedData['activeCalories'] as int? ?? 0;
+        });
+      }
+    }
+  }
+
+  /// Syncs historical health data from Health Connect to Firestore
+  Future<void> _syncHistoricalHealthData() async {
+    final hasPermissions = await _healthService.hasPermissions();
+    if (!hasPermissions) return;
+
+    // Get sync start date (healthConnectedDate or first entry date)
+    final profile = await _storage.loadProfile();
+    DateTime? startDate;
+
+    final healthConnectedDateStr = profile?['healthConnectedDate'] as String?;
+    if (healthConnectedDateStr != null) {
+      startDate = DateTime.tryParse(healthConnectedDateStr);
+    }
+
+    // Fallback to first entry date if no healthConnectedDate
+    if (startDate == null && _entries.isNotEmpty) {
+      final sortedDates = _entries.map((e) => e.dateTime).toList()..sort();
+      startDate = sortedDates.first;
+    }
+
+    // If still no date, use 30 days ago as default
+    startDate ??= DateTime.now().subtract(const Duration(days: 30));
+
+    // Get existing dates from cache
+    final existingDates = _exerciseCache.keys.toSet();
+
+    // Sync from Health Connect
+    debugPrint('HomeScreen: Starting historical sync from $startDate');
+    final newData = await _healthService.syncHistoricalData(
+      startDate: startDate,
+      existingDates: existingDates,
+    );
+
+    if (newData.isNotEmpty) {
+      // Save to Firestore
+      final batch = newData
+          .map(
+            (data) => {
+              'date': data.date.toIso8601String(),
+              'activeCalories': data.activeCalories,
+              'basalCalories': data.basalCalories,
+            },
+          )
+          .toList();
+
+      await _storage.saveExerciseDataBatch(batch);
+
+      // Update cache
+      for (final data in newData) {
+        final dateId = _dateToId(data.date);
+        _exerciseCache[dateId] = {
+          'date': data.date.toIso8601String(),
+          'activeCalories': data.activeCalories,
+          'basalCalories': data.basalCalories,
+        };
+      }
+
+      // Update display for selected date if it was synced
+      final selectedDateId = _dateToId(_selectedDate);
+      final selectedData = _exerciseCache[selectedDateId];
+      if (selectedData != null && mounted) {
+        setState(() {
+          _exerciseCalories = selectedData['activeCalories'] as int? ?? 0;
+        });
+      }
+
+      debugPrint('HomeScreen: Synced ${newData.length} days of exercise data');
+    } else {
+      debugPrint('HomeScreen: No new exercise data to sync');
+    }
+
+    // Debug: try to fetch all health data
+    await _healthService.debugFetchAllData();
+
+    // Sync weight data (always, regardless of exercise data)
+    await _syncWeightData(startDate);
+  }
+
+  /// Syncs weight data from Health Connect to Firestore
+  Future<void> _syncWeightData(DateTime startDate) async {
+    // Get existing weight dates
+    final existingWeightDates = _weights
+        .map((w) => _dateToId(w.dateTime))
+        .toSet();
+
+    // For weight, look back further (90 days or startDate, whichever is earlier)
+    final ninetyDaysAgo = DateTime.now().subtract(const Duration(days: 90));
+    final weightStartDate = startDate.isBefore(ninetyDaysAgo)
+        ? startDate
+        : ninetyDaysAgo;
+
+    // Sync from Health Connect
+    debugPrint('HomeScreen: Starting weight sync from $weightStartDate');
+    final newWeightData = await _healthService.syncWeightData(
+      startDate: weightStartDate,
+      existingDates: existingWeightDates,
+    );
+
+    if (newWeightData.isEmpty) {
+      debugPrint('HomeScreen: No new weight data to sync');
+      return;
+    }
+
+    // Save to Firestore and update local state
+    final newEntries = <WeightEntry>[];
+    for (final data in newWeightData) {
+      final entry = WeightEntry.create(
+        weight: data.weightKg,
+        date: data.dateTime,
+      );
+      await _storage.saveWeight(entry);
+      newEntries.add(entry);
+    }
+
+    // Update local state
+    if (mounted && newEntries.isNotEmpty) {
+      setState(() {
+        _weights.addAll(newEntries);
+        // Sort by date descending
+        _weights.sort((a, b) => b.dateTime.compareTo(a.dateTime));
+      });
+    }
+
+    debugPrint('HomeScreen: Synced ${newEntries.length} weight entries');
+  }
+
+  /// Formats a date as YYYY-MM-DD
+  String _dateToId(DateTime date) {
+    return '${date.year}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
+  }
+
+  /// Gets the budget that was active on a specific date
+  int _getBudgetForDate(DateTime date) {
+    final dateKey = _dateToId(date);
+
+    // Find the most recent budget entry <= date
+    // Budget history is sorted by effectiveDate descending
+    for (final budget in _budgetHistory) {
+      final effectiveDate = budget['effectiveDate'] as String?;
+      if (effectiveDate != null && effectiveDate.compareTo(dateKey) <= 0) {
+        return budget['calorieBudget'] as int? ?? _calorieBudget;
+      }
+    }
+
+    // Fallback to default budget
+    return _calorieBudget;
   }
 
   /// Returns only entries from the selected date
@@ -125,6 +389,7 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() {
       _selectedDate = _selectedDate.subtract(const Duration(days: 1));
     });
+    _loadHealthData();
   }
 
   /// Navigate to next day (only if not already at today)
@@ -133,6 +398,7 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() {
       _selectedDate = _selectedDate.add(const Duration(days: 1));
     });
+    _loadHealthData();
   }
 
   /// Show date picker
@@ -147,6 +413,7 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() {
         _selectedDate = picked;
       });
+      _loadHealthData();
     }
   }
 
@@ -160,12 +427,16 @@ class _HomeScreenState extends State<HomeScreen> {
 
   /// Returns selected date's entries filtered by meal type
   List<FoodEntry> _entriesForMeal(MealType mealType) {
-    return _selectedDateEntries.where((entry) => entry.mealType == mealType).toList();
+    return _selectedDateEntries
+        .where((entry) => entry.mealType == mealType)
+        .toList();
   }
 
   /// Calculates calories for a specific meal
   int _caloriesForMeal(MealType mealType) {
-    return _entriesForMeal(mealType).fold(0, (sum, entry) => sum + entry.calories);
+    return _entriesForMeal(
+      mealType,
+    ).fold(0, (sum, entry) => sum + entry.calories);
   }
 
   /// Calculates total calories for selected date
@@ -174,10 +445,14 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   /// Calculates total macros for selected date
-  double get _totalFat => _selectedDateEntries.fold(0.0, (sum, entry) => sum + entry.fat);
-  double get _totalCarbs => _selectedDateEntries.fold(0.0, (sum, entry) => sum + entry.carbs);
-  double get _totalProtein => _selectedDateEntries.fold(0.0, (sum, entry) => sum + entry.protein);
-  double get _totalSugars => _selectedDateEntries.fold(0.0, (sum, entry) => sum + entry.sugars);
+  double get _totalFat =>
+      _selectedDateEntries.fold(0.0, (sum, entry) => sum + entry.fat);
+  double get _totalCarbs =>
+      _selectedDateEntries.fold(0.0, (sum, entry) => sum + entry.carbs);
+  double get _totalProtein =>
+      _selectedDateEntries.fold(0.0, (sum, entry) => sum + entry.protein);
+  double get _totalSugars =>
+      _selectedDateEntries.fold(0.0, (sum, entry) => sum + entry.sugars);
 
   // ============= Week calculation helpers for dashboard =============
 
@@ -231,7 +506,8 @@ class _HomeScreenState extends State<HomeScreen> {
     final entries = _entriesForDay(day);
     if (entries.isEmpty) return false;
     final dayCalories = entries.fold(0, (sum, e) => sum + e.calories);
-    return dayCalories <= _calorieBudget;
+    final dayBudget = _getBudgetForDate(day);
+    return dayCalories <= dayBudget;
   }
 
   /// Calculate current streak (consecutive days under budget ending today)
@@ -260,9 +536,13 @@ class _HomeScreenState extends State<HomeScreen> {
     // Get the week start for earliest date
     DateTime weekStart;
     if (_weekStartDay == 'sunday') {
-      weekStart = earliestDate.subtract(Duration(days: earliestDate.weekday % 7));
+      weekStart = earliestDate.subtract(
+        Duration(days: earliestDate.weekday % 7),
+      );
     } else {
-      weekStart = earliestDate.subtract(Duration(days: earliestDate.weekday - 1));
+      weekStart = earliestDate.subtract(
+        Duration(days: earliestDate.weekday - 1),
+      );
     }
 
     final now = DateTime.now();
@@ -335,25 +615,41 @@ class _HomeScreenState extends State<HomeScreen> {
     return current - older;
   }
 
-  /// Suggested calories per meal (based on typical distribution)
+  /// Suggested calories per meal (based on stored budgets or default distribution)
   int _suggestedCalories(MealType mealType) {
-    switch (mealType) {
-      case MealType.breakfast:
-        return (_calorieBudget * 0.25).round(); // 25%
-      case MealType.lunch:
-        return (_calorieBudget * 0.30).round(); // 30%
-      case MealType.dinner:
-        return (_calorieBudget * 0.30).round(); // 30%
-      case MealType.snacks:
-        return (_calorieBudget * 0.15).round(); // 15%
+    final mealKey = mealType.name; // 'breakfast', 'lunch', 'dinner', 'snacks'
+    final mealBudget = _mealBudgets[mealKey];
+    final todayBudget = _getBudgetForDate(_selectedDate);
+
+    // Default percentages if no custom budget set
+    final defaultPercents = {
+      'breakfast': 0.25,
+      'lunch': 0.30,
+      'dinner': 0.30,
+      'snacks': 0.15,
+    };
+
+    if (mealBudget != null) {
+      final value = mealBudget['value'] as int? ?? 0;
+      final isPercent = mealBudget['isPercent'] as bool? ?? true;
+
+      if (isPercent) {
+        return (todayBudget * value / 100).round();
+      } else {
+        return value; // Absolute calories
+      }
     }
+
+    // Fallback to default percentages
+    return (todayBudget * defaultPercents[mealKey]!).round();
   }
 
   /// Opens the add food screen and saves the new entry
   Future<void> _addFood(MealType mealType) async {
     final result = await Navigator.of(context).push<dynamic>(
       MaterialPageRoute(
-        builder: (context) => AddFoodScreen(mealType: mealType, date: _selectedDate),
+        builder: (context) =>
+            AddFoodScreen(mealType: mealType, date: _selectedDate),
       ),
     );
 
@@ -384,10 +680,7 @@ class _HomeScreenState extends State<HomeScreen> {
               padding: EdgeInsets.all(16),
               child: Text(
                 'Add food to...',
-                style: TextStyle(
-                  fontSize: 18,
-                  fontWeight: FontWeight.bold,
-                ),
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
               ),
             ),
             ListTile(
@@ -449,14 +742,19 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   /// Creates a saved meal from the current entries in a meal card
-  Future<void> _createMealFromEntries(MealType mealType, List<FoodEntry> entries) async {
+  Future<void> _createMealFromEntries(
+    MealType mealType,
+    List<FoodEntry> entries,
+  ) async {
     if (entries.isEmpty) {
       return;
     }
 
     // Load existing meals to check for duplicates
     final existingMeals = await _storage.loadMeals();
-    final existingNames = existingMeals.map((m) => m.name.toLowerCase()).toSet();
+    final existingNames = existingMeals
+        .map((m) => m.name.toLowerCase())
+        .toSet();
 
     final nameController = TextEditingController();
     final totalCalories = entries.fold(0, (sum, e) => sum + e.calories);
@@ -471,7 +769,10 @@ class _HomeScreenState extends State<HomeScreen> {
       context: context,
       builder: (context) => StatefulBuilder(
         builder: (context, setDialogState) => AlertDialog(
-          insetPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
+          insetPadding: const EdgeInsets.symmetric(
+            horizontal: 20,
+            vertical: 24,
+          ),
           title: const Text('Create Meal'),
           content: SizedBox(
             width: MediaQuery.of(context).size.width,
@@ -530,10 +831,12 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                 ),
                 const SizedBox(height: 8),
-                ...entries.map((e) => Text(
-                  '• ${e.name} (${e.calories} cal)',
-                  style: const TextStyle(fontSize: 14),
-                )),
+                ...entries.map(
+                  (e) => Text(
+                    '• ${e.name} (${e.calories} cal)',
+                    style: const TextStyle(fontSize: 14),
+                  ),
+                ),
               ],
             ),
           ),
@@ -550,7 +853,9 @@ class _HomeScreenState extends State<HomeScreen> {
                   return;
                 }
                 if (existingNames.contains(name.toLowerCase())) {
-                  setDialogState(() => errorText = 'A meal with this name already exists');
+                  setDialogState(
+                    () => errorText = 'A meal with this name already exists',
+                  );
                   return;
                 }
                 Navigator.pop(context);
@@ -565,18 +870,26 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   /// Saves a meal to storage
-  Future<void> _saveMeal(String name, List<FoodEntry> entries, List<MealType> mealTypes) async {
+  Future<void> _saveMeal(
+    String name,
+    List<FoodEntry> entries,
+    List<MealType> mealTypes,
+  ) async {
     final meal = Meal(
       id: DateTime.now().millisecondsSinceEpoch.toString(),
       name: name,
-      items: entries.map((e) => MealItem(
-        name: e.name,
-        calories: e.calories,
-        fat: e.fat,
-        carbs: e.carbs,
-        protein: e.protein,
-        sugars: e.sugars,
-      )).toList(),
+      items: entries
+          .map(
+            (e) => MealItem(
+              name: e.name,
+              calories: e.calories,
+              fat: e.fat,
+              carbs: e.carbs,
+              protein: e.protein,
+              sugars: e.sugars,
+            ),
+          )
+          .toList(),
       mealTypes: mealTypes,
     );
     await _storage.saveMeal(meal);
@@ -596,120 +909,23 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  /// Builds a card for a meal category
-  Widget _buildMealCard(MealType mealType) {
-    final entries = _entriesForMeal(mealType);
-    final currentCalories = _caloriesForMeal(mealType);
-    final suggested = _suggestedCalories(mealType);
-
-    return Card(
-      margin: const EdgeInsets.only(bottom: 12),
-      elevation: 0,
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(12),
-        side: BorderSide(color: Theme.of(context).dividerColor),
-      ),
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            // Header row with meal name, calories, and menu
-            Row(
-              children: [
-                // Meal name on the left
-                Text(
-                  _mealName(mealType),
-                  style: const TextStyle(
-                    fontSize: 18,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-                const Spacer(),
-                // Calories
-                Text(
-                  '$currentCalories / $suggested cal',
-                  style: TextStyle(
-                    fontSize: 14,
-                    color: Theme.of(context).colorScheme.outline,
-                  ),
-                ),
-                // Three-dot menu
-                PopupMenuButton<String>(
-                  icon: Icon(
-                    Icons.more_vert,
-                    color: Theme.of(context).colorScheme.outline,
-                  ),
-                  onSelected: (value) {
-                    switch (value) {
-                      case 'create_meal':
-                        _createMealFromEntries(mealType, entries);
-                        break;
-                      case 'clear_all':
-                        _clearMealEntries(entries);
-                        break;
-                    }
-                  },
-                  itemBuilder: (context) => [
-                    const PopupMenuItem(
-                      value: 'create_meal',
-                      child: Text('Create Meal'),
-                    ),
-                    if (entries.isNotEmpty)
-                      const PopupMenuItem(
-                        value: 'clear_all',
-                        child: Text('Clear All'),
-                      ),
-                  ],
-                ),
-              ],
-            ),
-
-            // Food entries for this meal
-            if (entries.isNotEmpty) ...[
-              const SizedBox(height: 12),
-              const Divider(height: 1),
-              ...entries.map((entry) => ListTile(
-                    contentPadding: EdgeInsets.zero,
-                    title: Text(entry.name),
-                    trailing: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Text(
-                          '${entry.calories} cal',
-                          style: TextStyle(
-                            color: Theme.of(context).colorScheme.outline,
-                          ),
-                        ),
-                        IconButton(
-                          icon: const Icon(Icons.close, size: 20),
-                          onPressed: () => _deleteEntry(entry.id),
-                        ),
-                      ],
-                    ),
-                  )),
-            ],
-
-            // Add food button
-            const SizedBox(height: 8),
-            SizedBox(
-              width: double.infinity,
-              child: OutlinedButton.icon(
-                onPressed: () => _addFood(mealType),
-                icon: const Icon(Icons.add),
-                label: const Text('Add Food'),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
   /// Formats selected date for display in app bar
   String get _shortFormattedDate {
     final days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-    final months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    final months = [
+      'Jan',
+      'Feb',
+      'Mar',
+      'Apr',
+      'May',
+      'Jun',
+      'Jul',
+      'Aug',
+      'Sep',
+      'Oct',
+      'Nov',
+      'Dec',
+    ];
     return '${days[_selectedDate.weekday - 1]}, ${months[_selectedDate.month - 1]} ${_selectedDate.day.toString().padLeft(2, '0')}';
   }
 
@@ -726,34 +942,50 @@ class _HomeScreenState extends State<HomeScreen> {
       return 'Yesterday';
     }
     final months = [
-      'January', 'February', 'March', 'April', 'May', 'June',
-      'July', 'August', 'September', 'October', 'November', 'December'
+      'January',
+      'February',
+      'March',
+      'April',
+      'May',
+      'June',
+      'July',
+      'August',
+      'September',
+      'October',
+      'November',
+      'December',
     ];
     return '${months[_selectedDate.month - 1]} ${_selectedDate.day}, ${_selectedDate.year}';
   }
 
   /// Builds the date navigation widget for the app bar
   Widget _buildDateNavigation() {
+    final iconColor = Theme.of(context).colorScheme.onSurface;
+    final disabledColor = Theme.of(context).colorScheme.outline;
+
     return Row(
       mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.center,
       children: [
         IconButton(
-          icon: const Icon(Icons.chevron_left),
+          icon: Icon(Icons.chevron_left, size: 28, color: iconColor),
           onPressed: _goToPreviousDay,
-          visualDensity: VisualDensity.compact,
+          padding: EdgeInsets.zero,
+          constraints: const BoxConstraints(),
         ),
         GestureDetector(
           onTap: _selectDate,
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              const Icon(Icons.calendar_today, size: 18),
+              Icon(Icons.calendar_today, size: 22, color: iconColor),
               const SizedBox(width: 8),
               Text(
                 _shortFormattedDate,
-                style: const TextStyle(
-                  fontSize: 16,
+                style: TextStyle(
+                  fontSize: 18,
                   fontWeight: FontWeight.w500,
+                  color: iconColor,
                 ),
               ),
             ],
@@ -762,10 +994,12 @@ class _HomeScreenState extends State<HomeScreen> {
         IconButton(
           icon: Icon(
             Icons.chevron_right,
-            color: _isToday ? Colors.grey : Colors.white,
+            size: 28,
+            color: _isToday ? disabledColor : iconColor,
           ),
           onPressed: _isToday ? null : _goToNextDay,
-          visualDensity: VisualDensity.compact,
+          padding: EdgeInsets.zero,
+          constraints: const BoxConstraints(),
         ),
       ],
     );
@@ -773,13 +1007,15 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final backgroundColor = Theme.of(context).scaffoldBackgroundColor;
+
     return Scaffold(
-      backgroundColor: Theme.of(context).colorScheme.surfaceContainerHighest,
       appBar: AppBar(
+        backgroundColor: backgroundColor,
+        elevation: 0,
+        scrolledUnderElevation: 0,
         title: _buildDateNavigation(),
         centerTitle: true,
-        backgroundColor: const Color(0xFF2D2D2D),
-        foregroundColor: Colors.white,
         actions: [
           PopupMenuButton<String>(
             icon: const Icon(Icons.menu),
@@ -803,19 +1039,10 @@ class _HomeScreenState extends State<HomeScreen> {
               }
             },
             itemBuilder: (context) => [
-              const PopupMenuItem(
-                value: 'profile',
-                child: Text('Profile'),
-              ),
-              const PopupMenuItem(
-                value: 'settings',
-                child: Text('Settings'),
-              ),
+              const PopupMenuItem(value: 'profile', child: Text('Profile')),
+              const PopupMenuItem(value: 'settings', child: Text('Settings')),
               const PopupMenuDivider(),
-              const PopupMenuItem(
-                value: 'logout',
-                child: Text('Logout'),
-              ),
+              const PopupMenuItem(value: 'logout', child: Text('Logout')),
             ],
           ),
         ],
@@ -823,14 +1050,13 @@ class _HomeScreenState extends State<HomeScreen> {
       body: _isLoading
           ? const Center(child: CircularProgressIndicator())
           : _currentTab == 0
-              ? _buildDashboardTab()
-              : _buildLogTab(),
+          ? _buildDashboardTab()
+          : _buildLogTab(),
       bottomNavigationBar: BottomAppBar(
-        shape: const CircularNotchedRectangle(),
-        notchMargin: 8,
+        color: backgroundColor,
+        elevation: 0,
         height: 60,
         padding: EdgeInsets.zero,
-        color: const Color(0xFF2D2D2D),
         child: Row(
           mainAxisAlignment: MainAxisAlignment.spaceAround,
           children: [
@@ -838,44 +1064,54 @@ class _HomeScreenState extends State<HomeScreen> {
             Expanded(
               child: InkWell(
                 onTap: () => setState(() => _currentTab = 0),
+                splashColor: Colors.transparent,
+                highlightColor: Colors.transparent,
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
                     Icon(
                       Icons.bar_chart_rounded,
-                      color: _currentTab == 0 ? Colors.white : Colors.white60,
+                      color: _currentTab == 0
+                          ? Theme.of(context).colorScheme.primary
+                          : Theme.of(context).colorScheme.outline,
                     ),
                     Text(
                       'Dashboard',
                       style: TextStyle(
                         fontSize: 12,
-                        color: _currentTab == 0 ? Colors.white : Colors.white60,
+                        color: _currentTab == 0
+                            ? Theme.of(context).colorScheme.primary
+                            : Theme.of(context).colorScheme.outline,
                       ),
                     ),
                   ],
                 ),
               ),
             ),
-            // Spacer for FAB
-            const SizedBox(width: 48),
             // Log tab
             Expanded(
               child: InkWell(
                 onTap: () => setState(() => _currentTab = 1),
+                splashColor: Colors.transparent,
+                highlightColor: Colors.transparent,
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
                     Icon(
                       Icons.assignment_outlined,
-                      color: _currentTab == 1 ? Colors.white : Colors.white60,
+                      color: _currentTab == 1
+                          ? Theme.of(context).colorScheme.primary
+                          : Theme.of(context).colorScheme.outline,
                     ),
                     Text(
                       'Log',
                       style: TextStyle(
                         fontSize: 12,
-                        color: _currentTab == 1 ? Colors.white : Colors.white60,
+                        color: _currentTab == 1
+                            ? Theme.of(context).colorScheme.primary
+                            : Theme.of(context).colorScheme.outline,
                       ),
                     ),
                   ],
@@ -885,46 +1121,51 @@ class _HomeScreenState extends State<HomeScreen> {
           ],
         ),
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _showMealSelector,
-        shape: const CircleBorder(),
-        backgroundColor: Theme.of(context).colorScheme.primary,
-        foregroundColor: Colors.white,
-        child: const Icon(Icons.add),
-      ),
-      floatingActionButtonLocation: FloatingActionButtonLocation.centerDocked,
     );
   }
 
   /// Builds the Dashboard tab content
   Widget _buildDashboardTab() {
-    return ListView(
-      padding: const EdgeInsets.all(16),
-      children: [
-        _buildDashboardCaloriesCard(),
-        const SizedBox(height: 16),
-        _buildDashboardMacrosCard(),
-        const SizedBox(height: 16),
-        _buildDashboardStreakCard(),
-        const SizedBox(height: 16),
-        _buildDashboardWeightCard(),
-        const SizedBox(height: 80), // Space for FAB
-      ],
+    return RefreshIndicator(
+      onRefresh: _onRefresh,
+      child: ListView(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 16),
+        children: [
+          _buildDashboardCaloriesCard(),
+          const SizedBox(height: 8),
+          _buildDashboardMacrosCard(),
+          const SizedBox(height: 8),
+          _buildDashboardStreakCard(),
+          const SizedBox(height: 8),
+          _buildDashboardWeightCard(),
+          const SizedBox(height: 80), // Space for FAB
+        ],
+      ),
     );
   }
 
   /// Builds the Calories card for the dashboard
   Widget _buildDashboardCaloriesCard() {
+    final budget = _getBudgetForDate(_selectedDate);
     final todayCalories = _totalCalories;
-    final remaining = _calorieBudget - todayCalories;
+    final remaining = budget - todayCalories;
 
-    return Card(
-      elevation: 0,
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(12),
-        side: BorderSide(color: Theme.of(context).dividerColor),
-      ),
-      child: Padding(
+    return GestureDetector(
+      onTap: () {
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (_) => CaloriesDetailScreen(
+              initialDate: _selectedDate,
+              calorieBudget: budget,
+              entries: _entries,
+              exerciseData: _exerciseCache,
+              weekStartDay: _weekStartDay,
+            ),
+          ),
+        );
+      },
+      child: AppCard(
         padding: const EdgeInsets.all(16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -932,10 +1173,7 @@ class _HomeScreenState extends State<HomeScreen> {
             // Header
             const Text(
               'Calories',
-              style: TextStyle(
-                fontSize: 18,
-                fontWeight: FontWeight.bold,
-              ),
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 16),
             // Circular progress + weekly bars
@@ -956,7 +1194,8 @@ class _HomeScreenState extends State<HomeScreen> {
 
   /// Builds the circular progress indicator for dashboard
   Widget _buildDashboardCircularProgress(int remaining) {
-    final progress = _totalCalories / _calorieBudget;
+    final budget = _getBudgetForDate(_selectedDate);
+    final progress = _totalCalories / budget;
     final isOver = remaining < 0;
 
     return SizedBox(
@@ -965,16 +1204,14 @@ class _HomeScreenState extends State<HomeScreen> {
       child: Stack(
         alignment: Alignment.center,
         children: [
-          SizedBox(
-            width: 100,
-            height: 100,
-            child: CircularProgressIndicator(
-              value: progress.clamp(0.0, 1.0),
-              strokeWidth: 8,
-              backgroundColor: Theme.of(context).colorScheme.surfaceContainerHighest,
-              valueColor: AlwaysStoppedAnimation<Color>(
-                isOver ? Colors.red : Colors.green,
-              ),
+          CustomPaint(
+            size: const Size(100, 100),
+            painter: _ArcPainter(
+              progress: progress.clamp(0.0, 1.0),
+              backgroundColor:
+                  Theme.of(context).colorScheme.surfaceContainerHighest,
+              progressColor: isOver ? Colors.red : Colors.green,
+              strokeWidth: 12,
             ),
           ),
           Column(
@@ -1005,67 +1242,78 @@ class _HomeScreenState extends State<HomeScreen> {
   /// Builds the weekly calorie bars for dashboard
   Widget _buildWeeklyCaloriesBars() {
     final days = _weekStartDay == 'sunday'
-        ? ['Su', 'M', 'Tu', 'W', 'Th', 'Fr', 'Sa']
-        : ['M', 'Tu', 'W', 'Th', 'Fr', 'Sa', 'Su'];
+        ? ['S', 'M', 'T', 'W', 'T', 'F', 'S']
+        : ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
     final now = DateTime.now();
     final calories = _weeklyCalories;
-    final maxCalories = _calorieBudget.toDouble();
     const barHeight = 100.0;
 
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-      crossAxisAlignment: CrossAxisAlignment.end,
-      children: List.generate(7, (i) {
-        final dayCalories = calories[i];
-        final fillRatio = (dayCalories / maxCalories).clamp(0.0, 1.0);
-        final day = _weekStart.add(Duration(days: i));
-        final isToday = _isSameDay(day, now);
-        final isSelected = _isSameDay(day, _selectedDate);
-        final isOverBudget = dayCalories > _calorieBudget;
+    return SizedBox(
+      height: barHeight + 38, // bar + spacing + label
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: List.generate(7, (i) {
+          final day = _weekStart.add(Duration(days: i));
+          final dayBudget = _getBudgetForDate(day);
+          final dayCalories = calories[i];
+          final fillRatio = (dayCalories / dayBudget).clamp(0.0, 1.0);
+          final isToday = _isSameDay(day, now);
+          final isSelected = _isSameDay(day, _selectedDate);
+          final isOverBudget = dayCalories > dayBudget;
 
-        return GestureDetector(
-          onTap: () {
-            setState(() {
-              _selectedDate = day;
-            });
-          },
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              // Bar with gray background and colored fill
-              Container(
-                width: 24,
-                height: barHeight,
-                decoration: BoxDecoration(
-                  color: Theme.of(context).colorScheme.surfaceContainerHighest,
-                  borderRadius: BorderRadius.circular(4),
-                ),
-                child: Align(
-                  alignment: Alignment.bottomCenter,
-                  child: Container(
-                    width: double.infinity,
-                    height: barHeight * fillRatio,
-                    decoration: BoxDecoration(
-                      color: isOverBudget ? Colors.red : Colors.green,
-                      borderRadius: BorderRadius.circular(4),
+          return Expanded(
+            child: GestureDetector(
+              onTap: () {
+                setState(() {
+                  _selectedDate = day;
+                });
+              },
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 2),
+                child: Column(
+                  children: [
+                    // Bar with gray background and colored fill
+                    Container(
+                      height: barHeight,
+                      decoration: BoxDecoration(
+                        color: Theme.of(
+                          context,
+                        ).colorScheme.surfaceContainerHighest,
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: Align(
+                        alignment: Alignment.bottomCenter,
+                        child: Container(
+                          width: double.infinity,
+                          height: barHeight * fillRatio,
+                          decoration: BoxDecoration(
+                            color: isOverBudget ? Colors.red : Colors.green,
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                        ),
+                      ),
                     ),
-                  ),
+                    const SizedBox(height: 4),
+                    // Day label
+                    Text(
+                      days[i],
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: (isSelected || isToday)
+                            ? FontWeight.bold
+                            : FontWeight.normal,
+                        color: isToday
+                            ? Theme.of(context).colorScheme.onSurface
+                            : Theme.of(context).colorScheme.outline,
+                      ),
+                    ),
+                  ],
                 ),
               ),
-              const SizedBox(height: 4),
-              // Day label
-              Text(
-                days[i],
-                style: TextStyle(
-                  fontSize: 12,
-                  fontWeight: (isSelected || isToday) ? FontWeight.bold : FontWeight.normal,
-                  color: isToday ? Theme.of(context).colorScheme.onSurface : Theme.of(context).colorScheme.outline,
-                ),
-              ),
-            ],
-          ),
-        );
-      }),
+            ),
+          );
+        }),
+      ),
     );
   }
 
@@ -1081,64 +1329,60 @@ class _HomeScreenState extends State<HomeScreen> {
       totalProtein += dayMacros['protein']!;
     }
     final totalMacros = totalFat + totalCarbs + totalProtein;
-    final fatPercent = totalMacros > 0 ? (totalFat / totalMacros * 100).round() : 0;
-    final carbsPercent = totalMacros > 0 ? (totalCarbs / totalMacros * 100).round() : 0;
-    final proteinPercent = totalMacros > 0 ? (totalProtein / totalMacros * 100).round() : 0;
+    final fatPercent = totalMacros > 0
+        ? (totalFat / totalMacros * 100).round()
+        : 0;
+    final carbsPercent = totalMacros > 0
+        ? (totalCarbs / totalMacros * 100).round()
+        : 0;
+    final proteinPercent = totalMacros > 0
+        ? (totalProtein / totalMacros * 100).round()
+        : 0;
 
-    return Card(
-      elevation: 0,
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(12),
-        side: BorderSide(color: Theme.of(context).dividerColor),
-      ),
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            // Header
-            const Text(
-              'Macronutrients',
-              style: TextStyle(
-                fontSize: 18,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-            const SizedBox(height: 12),
-            // Legend
-            Row(
-              children: [
-                _buildMacroLegendDot(Colors.amber, 'Fat'),
-                const SizedBox(width: 16),
-                _buildMacroLegendDot(Colors.purple.shade300, 'Carbs'),
-                const SizedBox(width: 16),
-                _buildMacroLegendDot(const Color(0xFF5CCECB), 'Protein'),
-              ],
-            ),
-            const SizedBox(height: 16),
-            // Stacked bar chart
-            _buildWeeklyMacrosBars(),
-            const SizedBox(height: 16),
-            // Average chips
-            Row(
-              children: [
-                Text(
-                  'Average',
-                  style: TextStyle(
-                    fontSize: 14,
-                    color: Theme.of(context).colorScheme.outline,
-                  ),
+    return AppCard(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Header
+          const Text(
+            'Macronutrients',
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 12),
+          // Legend
+          Row(
+            children: [
+              _buildMacroLegendDot(Colors.amber, 'Fat'),
+              const SizedBox(width: 16),
+              _buildMacroLegendDot(Colors.purple.shade300, 'Carbs'),
+              const SizedBox(width: 16),
+              _buildMacroLegendDot(const Color(0xFF5CCECB), 'Protein'),
+            ],
+          ),
+          const SizedBox(height: 16),
+          // Stacked bar chart
+          _buildWeeklyMacrosBars(),
+          const SizedBox(height: 16),
+          // Average chips
+          Row(
+            children: [
+              Text(
+                'Average',
+                style: TextStyle(
+                  fontSize: 14,
+                  color: Theme.of(context).colorScheme.outline,
                 ),
-                const SizedBox(width: 12),
-                _buildAverageChip('$fatPercent%', Colors.amber.shade100),
-                const SizedBox(width: 8),
-                _buildAverageChip('$carbsPercent%', Colors.purple.shade50),
-                const SizedBox(width: 8),
-                _buildAverageChip('$proteinPercent%', const Color(0xFFD4F5F4)),
-              ],
-            ),
-          ],
-        ),
+              ),
+              const SizedBox(width: 12),
+              _buildAverageChip('$fatPercent%', Colors.amber.shade100),
+              const SizedBox(width: 8),
+              _buildAverageChip('$carbsPercent%', Colors.purple.shade50),
+              const SizedBox(width: 8),
+              _buildAverageChip('$proteinPercent%', const Color(0xFFD4F5F4)),
+            ],
+          ),
+        ],
       ),
     );
   }
@@ -1151,10 +1395,7 @@ class _HomeScreenState extends State<HomeScreen> {
         Container(
           width: 10,
           height: 10,
-          decoration: BoxDecoration(
-            color: color,
-            shape: BoxShape.circle,
-          ),
+          decoration: BoxDecoration(color: color, shape: BoxShape.circle),
         ),
         const SizedBox(width: 4),
         Text(
@@ -1181,6 +1422,7 @@ class _HomeScreenState extends State<HomeScreen> {
         style: const TextStyle(
           fontSize: 12,
           fontWeight: FontWeight.w500,
+          color: Colors.black87,
         ),
       ),
     );
@@ -1189,8 +1431,8 @@ class _HomeScreenState extends State<HomeScreen> {
   /// Builds the weekly macros stacked bars
   Widget _buildWeeklyMacrosBars() {
     final days = _weekStartDay == 'sunday'
-        ? ['Su', 'M', 'Tu', 'W', 'Th', 'Fr', 'Sa']
-        : ['M', 'Tu', 'W', 'Th', 'Fr', 'Sa', 'Su'];
+        ? ['S', 'M', 'T', 'W', 'T', 'F', 'S']
+        : ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
     final now = DateTime.now();
     final macros = _weeklyMacros;
     const barHeight = 100.0;
@@ -1204,10 +1446,17 @@ class _HomeScreenState extends State<HomeScreen> {
         final isToday = _isSameDay(day, now);
         final isSelected = _isSameDay(day, _selectedDate);
 
-        final total = dayMacros['fat']! + dayMacros['carbs']! + dayMacros['protein']!;
-        final fatFlex = total > 0 ? (dayMacros['fat']! / total * 100).round() : 0;
-        final carbsFlex = total > 0 ? (dayMacros['carbs']! / total * 100).round() : 0;
-        final proteinFlex = total > 0 ? (dayMacros['protein']! / total * 100).round() : 0;
+        final total =
+            dayMacros['fat']! + dayMacros['carbs']! + dayMacros['protein']!;
+        final fatFlex = total > 0
+            ? (dayMacros['fat']! / total * 100).round()
+            : 0;
+        final carbsFlex = total > 0
+            ? (dayMacros['carbs']! / total * 100).round()
+            : 0;
+        final proteinFlex = total > 0
+            ? (dayMacros['protein']! / total * 100).round()
+            : 0;
 
         return GestureDetector(
           onTap: () {
@@ -1235,7 +1484,9 @@ class _HomeScreenState extends State<HomeScreen> {
                             if (proteinFlex > 0)
                               Expanded(
                                 flex: proteinFlex,
-                                child: Container(color: const Color(0xFF5CCECB)),
+                                child: Container(
+                                  color: const Color(0xFF5CCECB),
+                                ),
                               ),
                             // Carbs (middle - light purple)
                             if (carbsFlex > 0)
@@ -1260,8 +1511,12 @@ class _HomeScreenState extends State<HomeScreen> {
                 days[i],
                 style: TextStyle(
                   fontSize: 12,
-                  fontWeight: (isSelected || isToday) ? FontWeight.bold : FontWeight.normal,
-                  color: isToday ? Theme.of(context).colorScheme.onSurface : Theme.of(context).colorScheme.outline,
+                  fontWeight: (isSelected || isToday)
+                      ? FontWeight.bold
+                      : FontWeight.normal,
+                  color: isToday
+                      ? Theme.of(context).colorScheme.onSurface
+                      : Theme.of(context).colorScheme.outline,
                 ),
               ),
             ],
@@ -1273,48 +1528,35 @@ class _HomeScreenState extends State<HomeScreen> {
 
   /// Builds the Streaks card for the dashboard
   Widget _buildDashboardStreakCard() {
-    return Card(
-      elevation: 0,
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(12),
-        side: BorderSide(color: Theme.of(context).dividerColor),
-      ),
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text(
-              'Streaks',
-              style: TextStyle(
-                fontSize: 18,
-                fontWeight: FontWeight.bold,
+    return AppCard(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'Streaks',
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 16),
+          // Stats row
+          Row(
+            children: [
+              Expanded(
+                child: _buildStreakStat(value: _currentStreak, label: 'days'),
               ),
-            ),
-            const SizedBox(height: 16),
-            // Stats row
-            Row(
-              children: [
-                Expanded(
-                  child: _buildStreakStat(
-                    value: _currentStreak,
-                    label: 'days',
-                  ),
+              const SizedBox(width: 16),
+              Expanded(
+                child: _buildStreakStat(
+                  value: _perfectWeeksCount,
+                  label: 'perfect weeks',
                 ),
-                const SizedBox(width: 16),
-                Expanded(
-                  child: _buildStreakStat(
-                    value: _perfectWeeksCount,
-                    label: 'perfect weeks',
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 20),
-            // GitHub-style grid
-            _buildStreakGrid(),
-          ],
-        ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 20),
+          // GitHub-style grid
+          _buildStreakGrid(),
+        ],
       ),
     );
   }
@@ -1324,10 +1566,7 @@ class _HomeScreenState extends State<HomeScreen> {
       children: [
         Text(
           '$value',
-          style: const TextStyle(
-            fontSize: 32,
-            fontWeight: FontWeight.bold,
-          ),
+          style: const TextStyle(fontSize: 32, fontWeight: FontWeight.bold),
         ),
         const SizedBox(height: 4),
         Text(
@@ -1353,10 +1592,13 @@ class _HomeScreenState extends State<HomeScreen> {
       children: List.generate(7, (dayIndex) {
         final day = _weekStart.add(Duration(days: dayIndex));
         final isFuture = day.isAfter(now);
+        final isToday = _isSameDay(day, now);
+        final isSelected = _isSameDay(day, _selectedDate);
         final entries = _entriesForDay(day);
         final hasEntries = entries.isNotEmpty;
         final dayCalories = entries.fold(0, (sum, e) => sum + e.calories);
-        final isUnderBudget = dayCalories <= _calorieBudget;
+        final dayBudget = _getBudgetForDate(day);
+        final isUnderBudget = dayCalories <= dayBudget;
 
         Color cellColor;
         if (isFuture) {
@@ -1366,7 +1608,7 @@ class _HomeScreenState extends State<HomeScreen> {
         } else if (hasEntries && !isUnderBudget) {
           cellColor = Colors.red;
         } else {
-          cellColor = Theme.of(context).colorScheme.outlineVariant;
+          cellColor = Theme.of(context).colorScheme.surfaceContainerHighest;
         }
 
         return Column(
@@ -1384,7 +1626,12 @@ class _HomeScreenState extends State<HomeScreen> {
               dayLabels[dayIndex],
               style: TextStyle(
                 fontSize: 12,
-                color: Theme.of(context).colorScheme.outline,
+                fontWeight: (isSelected || isToday)
+                    ? FontWeight.bold
+                    : FontWeight.normal,
+                color: isToday
+                    ? Theme.of(context).colorScheme.onSurface
+                    : Theme.of(context).colorScheme.outline,
               ),
             ),
           ],
@@ -1398,76 +1645,77 @@ class _HomeScreenState extends State<HomeScreen> {
     final latest = _latestWeight;
     final change = _weightChangeMonth;
 
-    return Card(
-      elevation: 0,
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(12),
-        side: BorderSide(color: Theme.of(context).dividerColor),
-      ),
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            // Header row
-            Row(
-              children: [
-                const Text(
-                  'Weight',
-                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-                ),
-                const Spacer(),
-                if (change != null)
-                  Text(
-                    '${change >= 0 ? '↑' : '↓'}${_displayWeight(change.abs()).toStringAsFixed(1)} $_weightUnit',
-                    style: TextStyle(
-                      color: Theme.of(context).colorScheme.outline,
-                      fontSize: 14,
-                    ),
+    return AppCard(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Header row
+          Row(
+            children: [
+              const Text(
+                'Weight',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+              ),
+              const Spacer(),
+              if (change != null)
+                Text(
+                  '${change >= 0 ? '↑' : '↓'}${_displayWeight(change.abs()).toStringAsFixed(1)} $_weightUnit',
+                  style: TextStyle(
+                    color: Theme.of(context).colorScheme.outline,
+                    fontSize: 14,
                   ),
-              ],
-            ),
-            if (change != null)
-              Align(
-                alignment: Alignment.centerRight,
-                child: Text(
-                  'past month',
-                  style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.outline),
+                ),
+            ],
+          ),
+          if (change != null)
+            Align(
+              alignment: Alignment.centerRight,
+              child: Text(
+                'past month',
+                style: TextStyle(
+                  fontSize: 12,
+                  color: Theme.of(context).colorScheme.outline,
                 ),
               ),
-            const SizedBox(height: 16),
-            // Chart
-            SizedBox(
-              height: 120,
-              child: _buildWeightChart(),
             ),
-            const SizedBox(height: 16),
-            // Bottom row: latest weight + record button
-            Row(
-              children: [
-                Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      latest != null ? 'Latest' : 'No data',
-                      style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.outline),
+          const SizedBox(height: 16),
+          // Chart
+          SizedBox(height: 120, child: _buildWeightChart()),
+          const SizedBox(height: 16),
+          // Bottom row: latest weight + record button
+          Row(
+            children: [
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    latest != null ? 'Latest' : 'No data',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: Theme.of(context).colorScheme.outline,
                     ),
-                    Text(
-                      latest != null ? '${_displayWeight(latest.weight).toStringAsFixed(1)} $_weightUnit' : '--',
-                      style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-                    ),
-                  ],
-                ),
-                const Spacer(),
-                if (!_isFutureDate)
-                  FilledButton(
-                    onPressed: _showRecordWeightDialog,
-                    child: const Text('Record'),
                   ),
-              ],
-            ),
-          ],
-        ),
+                  Text(
+                    latest != null
+                        ? '${_displayWeight(latest.weight).toStringAsFixed(1)} $_weightUnit'
+                        : '--',
+                    style: const TextStyle(
+                      fontSize: 20,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ],
+              ),
+              const Spacer(),
+              if (!_isFutureDate)
+                FilledButton(
+                  onPressed: _showRecordWeightDialog,
+                  child: const Text('Record'),
+                ),
+            ],
+          ),
+        ],
       ),
     );
   }
@@ -1476,7 +1724,11 @@ class _HomeScreenState extends State<HomeScreen> {
   bool get _isFutureDate {
     final now = DateTime.now();
     final today = DateTime(now.year, now.month, now.day);
-    final selected = DateTime(_selectedDate.year, _selectedDate.month, _selectedDate.day);
+    final selected = DateTime(
+      _selectedDate.year,
+      _selectedDate.month,
+      _selectedDate.day,
+    );
     return selected.isAfter(today);
   }
 
@@ -1491,7 +1743,10 @@ class _HomeScreenState extends State<HomeScreen> {
     final validWeights = weights.whereType<double>().toList();
     if (validWeights.isEmpty) {
       return Center(
-        child: Text('No weight data', style: TextStyle(color: Theme.of(context).colorScheme.outline)),
+        child: Text(
+          'No weight data',
+          style: TextStyle(color: Theme.of(context).colorScheme.outline),
+        ),
       );
     }
 
@@ -1526,15 +1781,24 @@ class _HomeScreenState extends State<HomeScreen> {
                 children: [
                   Text(
                     '${displayMax.toStringAsFixed(0)}',
-                    style: TextStyle(fontSize: 10, color: Theme.of(context).colorScheme.outline),
+                    style: TextStyle(
+                      fontSize: 10,
+                      color: Theme.of(context).colorScheme.outline,
+                    ),
                   ),
                   Text(
                     '${displayMid.toStringAsFixed(0)}',
-                    style: TextStyle(fontSize: 10, color: Theme.of(context).colorScheme.outline),
+                    style: TextStyle(
+                      fontSize: 10,
+                      color: Theme.of(context).colorScheme.outline,
+                    ),
                   ),
                   Text(
                     '${displayMin.toStringAsFixed(0)}',
-                    style: TextStyle(fontSize: 10, color: Theme.of(context).colorScheme.outline),
+                    style: TextStyle(
+                      fontSize: 10,
+                      color: Theme.of(context).colorScheme.outline,
+                    ),
                   ),
                 ],
               ),
@@ -1548,8 +1812,10 @@ class _HomeScreenState extends State<HomeScreen> {
                     minWeight: minWeight,
                     maxWeight: maxWeight,
                     goalWeight: _targetWeight,
-                    goalLineColor: Theme.of(context).colorScheme.primary.withOpacity(0.5),
-                    gridColor: Theme.of(context).dividerColor,
+                    goalLineColor: Theme.of(
+                      context,
+                    ).colorScheme.primary.withOpacity(0.5),
+                    gridColor: Colors.grey.shade200,
                   ),
                 ),
               ),
@@ -1563,7 +1829,24 @@ class _HomeScreenState extends State<HomeScreen> {
             Expanded(
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                children: days.map((d) => Text(d, style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.outline))).toList(),
+                children: List.generate(7, (i) {
+                  final day = _weekStart.add(Duration(days: i));
+                  final now = DateTime.now();
+                  final isToday = _isSameDay(day, now);
+                  final isSelected = _isSameDay(day, _selectedDate);
+                  return Text(
+                    days[i],
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: (isSelected || isToday)
+                          ? FontWeight.bold
+                          : FontWeight.normal,
+                      color: isToday
+                          ? Theme.of(context).colorScheme.onSurface
+                          : Theme.of(context).colorScheme.outline,
+                    ),
+                  );
+                }),
               ),
             ),
           ],
@@ -1577,7 +1860,11 @@ class _HomeScreenState extends State<HomeScreen> {
     // Don't allow recording weight for future dates
     final now = DateTime.now();
     final today = DateTime(now.year, now.month, now.day);
-    final selected = DateTime(_selectedDate.year, _selectedDate.month, _selectedDate.day);
+    final selected = DateTime(
+      _selectedDate.year,
+      _selectedDate.month,
+      _selectedDate.day,
+    );
     if (selected.isAfter(today)) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Cannot record weight for future dates')),
@@ -1616,7 +1903,9 @@ class _HomeScreenState extends State<HomeScreen> {
             const SizedBox(height: 16),
             TextField(
               controller: controller,
-              keyboardType: const TextInputType.numberWithOptions(decimal: true),
+              keyboardType: const TextInputType.numberWithOptions(
+                decimal: true,
+              ),
               decoration: InputDecoration(
                 labelText: 'Weight ($unit)',
                 suffixText: unit,
@@ -1663,11 +1952,16 @@ class _HomeScreenState extends State<HomeScreen> {
         });
       } else {
         // Create new entry
-        final entry = WeightEntry.create(weight: weightInKg, date: _selectedDate);
+        final entry = WeightEntry.create(
+          weight: weightInKg,
+          date: _selectedDate,
+        );
         await _storage.saveWeight(entry);
         setState(() {
           // Insert in correct position (sorted by date descending)
-          final index = _weights.indexWhere((w) => w.dateTime.isBefore(entry.dateTime));
+          final index = _weights.indexWhere(
+            (w) => w.dateTime.isBefore(entry.dateTime),
+          );
           if (index == -1) {
             _weights.add(entry);
           } else {
@@ -1678,38 +1972,348 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  /// Builds the budget card content with circular progress and macros
+  Widget _buildBudgetContent() {
+    final budget = _getBudgetForDate(_selectedDate);
+    final eaten = _totalCalories;
+    final remaining = budget - eaten + _exerciseCalories;
+    final burned = _exerciseCalories;
+    final progress = eaten / budget;
+    final isOver = remaining < 0;
+
+    // Macro goals (example values - could be made configurable)
+    final carbsGoal = 258;
+    final proteinGoal = 103;
+    final fatGoal = 68;
+
+    // Colors based on over/under budget
+    final progressColor = isOver ? Colors.red : const Color(0xFF34D399);
+
+    return Column(
+      children: [
+        // Circular progress with eaten/remaining/burned
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            // Eaten
+            Column(
+              children: [
+                Text(
+                  '$eaten',
+                  style: const TextStyle(
+                    fontSize: 24,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                Text(
+                  'Eaten',
+                  style: TextStyle(
+                    fontSize: 16,
+                    color: Theme.of(context).colorScheme.outline,
+                  ),
+                ),
+              ],
+            ),
+            // Circular progress
+            SizedBox(
+              width: 130,
+              height: 130,
+              child: Stack(
+                alignment: Alignment.center,
+                children: [
+                  CustomPaint(
+                    size: const Size(130, 130),
+                    painter: _CircularProgressPainter(
+                      progress: progress.clamp(0.0, 1.0),
+                      backgroundColor: Colors.grey.shade200,
+                      progressColor: progressColor,
+                      strokeWidth: 10,
+                    ),
+                  ),
+                  Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        '${isOver ? remaining.abs() : remaining}',
+                        style: TextStyle(
+                          fontSize: 32,
+                          fontWeight: FontWeight.bold,
+                          color: isOver ? Colors.red : null,
+                        ),
+                      ),
+                      Text(
+                        isOver ? 'Over' : 'Remaining',
+                        style: TextStyle(
+                          fontSize: 14,
+                          color: isOver ? Colors.red : Theme.of(context).colorScheme.outline,
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            // Burned
+            Column(
+              children: [
+                Text(
+                  '$burned',
+                  style: const TextStyle(
+                    fontSize: 24,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                Text(
+                  'Burned',
+                  style: TextStyle(
+                    fontSize: 16,
+                    color: Theme.of(context).colorScheme.outline,
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+        const SizedBox(height: 24),
+        // Macro progress bars
+        Row(
+          children: [
+            Expanded(
+              child: _buildMacroProgress(
+                'Carbs',
+                _totalCarbs.round(),
+                carbsGoal,
+                Colors.purple.shade300,
+              ),
+            ),
+            const SizedBox(width: 16),
+            Expanded(
+              child: _buildMacroProgress(
+                'Protein',
+                _totalProtein.round(),
+                proteinGoal,
+                const Color(0xFF5CCECB),
+              ),
+            ),
+            const SizedBox(width: 16),
+            Expanded(
+              child: _buildMacroProgress(
+                'Fat',
+                _totalFat.round(),
+                fatGoal,
+                Colors.amber,
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  /// Builds a macro progress bar with label and values
+  Widget _buildMacroProgress(String label, int current, int goal, Color color) {
+    final progress = (current / goal).clamp(0.0, 1.0);
+    return Column(
+      children: [
+        Text(
+          label,
+          style: TextStyle(
+            fontSize: 14,
+            color: Theme.of(context).colorScheme.outline,
+          ),
+        ),
+        const SizedBox(height: 8),
+        ClipRRect(
+          borderRadius: BorderRadius.circular(4),
+          child: LinearProgressIndicator(
+            value: progress,
+            backgroundColor: Colors.grey.shade200,
+            valueColor: AlwaysStoppedAnimation<Color>(color),
+            minHeight: 6,
+          ),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          '$current / $goal g',
+          style: const TextStyle(
+            fontSize: 12,
+            fontWeight: FontWeight.w500,
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// Builds a meal card with name, calories, and add button
+  Widget _buildMealCard(MealType mealType) {
+    final calories = _caloriesForMeal(mealType);
+    final entries = _entriesForMeal(mealType);
+
+    return AppCard(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Header row
+          Row(
+            children: [
+              // Meal name and calories
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      _mealName(mealType),
+                      style: const TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    Text(
+                      '$calories Cal',
+                      style: TextStyle(
+                        fontSize: 14,
+                        color: Theme.of(context).colorScheme.outline,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              // Three-dot menu (only show when there are entries)
+              if (entries.isNotEmpty) _buildMealCardMenu(mealType, entries),
+            ],
+          ),
+          // Food entries
+          if (entries.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            const Divider(height: 1),
+            ...entries.map(
+              (entry) => Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        entry.name,
+                        style: const TextStyle(fontSize: 14),
+                      ),
+                    ),
+                    Text(
+                      '${entry.calories} Cal',
+                      style: TextStyle(
+                        fontSize: 14,
+                        color: Theme.of(context).colorScheme.outline,
+                      ),
+                    ),
+                    IconButton(
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints(),
+                      icon: Icon(
+                        Icons.close,
+                        size: 18,
+                        color: Theme.of(context).colorScheme.outline,
+                      ),
+                      onPressed: () => _deleteEntry(entry.id),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+          // Add button
+          const SizedBox(height: 12),
+          SizedBox(
+            width: double.infinity,
+            child: FilledButton(
+              onPressed: () => _addFood(mealType),
+              child: const Text('Add Food'),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Builds the three-dot menu for cards
+  Widget _buildCardMenu() {
+    return PopupMenuButton<String>(
+      icon: Icon(
+        Icons.more_vert,
+        color: Theme.of(context).colorScheme.outline,
+      ),
+      onSelected: (value) {},
+      itemBuilder: (context) => [],
+    );
+  }
+
+  /// Builds the three-dot menu for meal cards
+  Widget _buildMealCardMenu(MealType mealType, List<FoodEntry> entries) {
+    return PopupMenuButton<String>(
+      icon: Icon(
+        Icons.more_vert,
+        color: Theme.of(context).colorScheme.outline,
+      ),
+      onSelected: (value) {
+        switch (value) {
+          case 'create_meal':
+            _createMealFromEntries(mealType, entries);
+            break;
+          case 'clear_all':
+            _clearMealEntries(entries);
+            break;
+        }
+      },
+      itemBuilder: (context) => [
+        const PopupMenuItem(
+          value: 'create_meal',
+          child: Text('Create Meal'),
+        ),
+        if (entries.isNotEmpty)
+          const PopupMenuItem(
+            value: 'clear_all',
+            child: Text('Clear All'),
+          ),
+      ],
+    );
+  }
+
   /// Builds the Log tab content (meal cards)
   Widget _buildLogTab() {
-    final remaining = _calorieBudget - _totalCalories;
-    final progress = _totalCalories / _calorieBudget;
+    final budget = _getBudgetForDate(_selectedDate);
+    final remaining = budget - _totalCalories;
+    final progress = _totalCalories / budget;
 
     return Stack(
       children: [
-        // Scrollable content
-        ListView(
-          controller: _scrollController,
-          padding: const EdgeInsets.symmetric(horizontal: 16),
-          children: [
-            const SizedBox(height: 16),
-            // Calorie budget card
-            _buildCalorieCard(remaining, progress),
-            const SizedBox(height: 12),
-            // Macros summary
-            _buildMacrosSummary(),
-            const SizedBox(height: 16),
-            // Date header
-            Text(
-              _formattedDate,
-              style: Theme.of(context).textTheme.titleMedium,
-            ),
-            const SizedBox(height: 8),
-            // Meal cards
-            _buildMealCard(MealType.breakfast),
-            _buildMealCard(MealType.lunch),
-            _buildMealCard(MealType.dinner),
-            _buildMealCard(MealType.snacks),
-            const SizedBox(height: 80), // Space for FAB
-          ],
+        // Scrollable content with pull-to-refresh
+        RefreshIndicator(
+          onRefresh: _onRefresh,
+          child: ListView(
+            controller: _scrollController,
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            children: [
+              const SizedBox(height: 16),
+              // Budget card
+              AppCard(
+                title: 'Budget',
+                child: _buildBudgetContent(),
+              ),
+              const SizedBox(height: 8),
+              // Breakfast card
+              _buildMealCard(MealType.breakfast),
+              const SizedBox(height: 8),
+              // Lunch card
+              _buildMealCard(MealType.lunch),
+              const SizedBox(height: 8),
+              // Dinner card
+              _buildMealCard(MealType.dinner),
+              const SizedBox(height: 8),
+              // Snacks card
+              _buildMealCard(MealType.snacks),
+              const SizedBox(height: 80), // Space for bottom nav
+            ],
+          ),
         ),
         // Floating bar
         AnimatedPositioned(
@@ -1725,25 +2329,11 @@ class _HomeScreenState extends State<HomeScreen> {
 
   /// Builds the main calorie budget card
   Widget _buildCalorieCard(int remaining, double progress) {
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: Theme.of(context).cardColor,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Theme.of(context).dividerColor),
-      ),
+    final budget = _getBudgetForDate(_selectedDate);
+    return AppCard(
+      title: 'Budget: $budget cals',
       child: Column(
         children: [
-          // Budget header
-          Text(
-            'Budget: $_calorieBudget cals',
-            style: const TextStyle(
-              fontSize: 16,
-              fontWeight: FontWeight.w500,
-            ),
-          ),
-          const SizedBox(height: 16),
           // Circular progress with stats
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
@@ -1775,18 +2365,14 @@ class _HomeScreenState extends State<HomeScreen> {
                 child: Stack(
                   alignment: Alignment.center,
                   children: [
-                    SizedBox(
-                      width: 120,
-                      height: 120,
-                      child: CircularProgressIndicator(
-                        value: progress.clamp(0.0, 1.0),
-                        strokeWidth: 8,
-                        backgroundColor: Theme.of(context).colorScheme.surfaceContainerHighest,
-                        valueColor: AlwaysStoppedAnimation<Color>(
-                          remaining >= 0
-                              ? Colors.green
-                              : Colors.red,
-                        ),
+                    CustomPaint(
+                      size: const Size(120, 120),
+                      painter: _ArcPainter(
+                        progress: progress.clamp(0.0, 1.0),
+                        backgroundColor:
+                            Theme.of(context).colorScheme.surfaceContainerHighest,
+                        progressColor: remaining >= 0 ? Colors.green : Colors.red,
+                        strokeWidth: 14,
                       ),
                     ),
                     Column(
@@ -1823,9 +2409,9 @@ class _HomeScreenState extends State<HomeScreen> {
                     ),
                   ),
                   const SizedBox(height: 4),
-                  const Text(
-                    '0',
-                    style: TextStyle(
+                  Text(
+                    '$_exerciseCalories',
+                    style: const TextStyle(
                       fontSize: 24,
                       fontWeight: FontWeight.bold,
                     ),
@@ -1834,27 +2420,18 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             ],
           ),
-        ],
-      ),
-    );
-  }
-
-  /// Builds the macros summary row
-  Widget _buildMacrosSummary() {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-      decoration: BoxDecoration(
-        color: Theme.of(context).cardColor,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Theme.of(context).dividerColor),
-      ),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceAround,
-        children: [
-          _buildMacroColumn('Fat', _totalFat),
-          _buildMacroColumn('Carbs', _totalCarbs),
-          _buildMacroColumn('Protein', _totalProtein),
-          _buildMacroColumn('Sugar', _totalSugars),
+          // Spacing between calories and macros
+          const SizedBox(height: 20),
+          // Macros row
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceAround,
+            children: [
+              _buildMacroColumn('Fat', _totalFat),
+              _buildMacroColumn('Carbs', _totalCarbs),
+              _buildMacroColumn('Protein', _totalProtein),
+              _buildMacroColumn('Sugar', _totalSugars),
+            ],
+          ),
         ],
       ),
     );
@@ -1865,10 +2442,7 @@ class _HomeScreenState extends State<HomeScreen> {
       children: [
         Text(
           '${value.round()}g',
-          style: const TextStyle(
-            fontSize: 18,
-            fontWeight: FontWeight.bold,
-          ),
+          style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
         ),
         const SizedBox(height: 2),
         Text(
@@ -1884,8 +2458,9 @@ class _HomeScreenState extends State<HomeScreen> {
 
   /// Builds the floating progress bar that shows when scrolled
   Widget _buildFloatingBar(int remaining, double progress) {
+    final budget = _getBudgetForDate(_selectedDate);
     final isOver = remaining < 0;
-    final color = isOver ? Colors.red : Colors.green;
+    final color = isOver ? Colors.red : const Color(0xFF34D399);
 
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
@@ -1906,13 +2481,10 @@ class _HomeScreenState extends State<HomeScreen> {
             // Calories info
             Text(
               '$_totalCalories',
-              style: const TextStyle(
-                fontWeight: FontWeight.bold,
-                fontSize: 16,
-              ),
+              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
             ),
             Text(
-              ' / $_calorieBudget cal',
+              ' / $budget cal',
               style: TextStyle(
                 color: Theme.of(context).colorScheme.outline,
                 fontSize: 14,
@@ -1925,7 +2497,9 @@ class _HomeScreenState extends State<HomeScreen> {
                 borderRadius: BorderRadius.circular(4),
                 child: LinearProgressIndicator(
                   value: progress.clamp(0.0, 1.0),
-                  backgroundColor: Theme.of(context).colorScheme.surfaceContainerHighest,
+                  backgroundColor: Theme.of(
+                    context,
+                  ).colorScheme.surfaceContainerHighest,
                   valueColor: AlwaysStoppedAnimation<Color>(color),
                   minHeight: 8,
                 ),
@@ -1956,14 +2530,9 @@ class _ProfilePage extends StatelessWidget {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Profile'),
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        actions: [
-          _buildMenuButton(context),
-        ],
+        actions: [_buildMenuButton(context)],
       ),
-      body: const Center(
-        child: Text('Profile'),
-      ),
+      body: const Center(child: Text('Profile')),
     );
   }
 }
@@ -1993,19 +2562,10 @@ Widget _buildMenuButton(BuildContext context) {
       }
     },
     itemBuilder: (context) => [
-      const PopupMenuItem(
-        value: 'profile',
-        child: Text('Profile'),
-      ),
-      const PopupMenuItem(
-        value: 'settings',
-        child: Text('Settings'),
-      ),
+      const PopupMenuItem(value: 'profile', child: Text('Profile')),
+      const PopupMenuItem(value: 'settings', child: Text('Settings')),
       const PopupMenuDivider(),
-      const PopupMenuItem(
-        value: 'logout',
-        child: Text('Logout'),
-      ),
+      const PopupMenuItem(value: 'logout', child: Text('Logout')),
     ],
   );
 }
@@ -2064,14 +2624,22 @@ class _WeightChartPainter extends CustomPainter {
     }
 
     // Draw goal weight dashed line
-    if (goalWeight != null && goalWeight! >= minWeight && goalWeight! <= maxWeight) {
-      final goalY = size.height - ((goalWeight! - minWeight) / range * size.height);
+    if (goalWeight != null &&
+        goalWeight! >= minWeight &&
+        goalWeight! <= maxWeight) {
+      final goalY =
+          size.height - ((goalWeight! - minWeight) / range * size.height);
       final goalPaint = Paint()
         ..color = goalLineColor
         ..strokeWidth = 1.5
         ..style = PaintingStyle.stroke;
 
-      _drawDashedLine(canvas, Offset(0, goalY), Offset(size.width, goalY), goalPaint);
+      _drawDashedLine(
+        canvas,
+        Offset(0, goalY),
+        Offset(size.width, goalY),
+        goalPaint,
+      );
     }
 
     // Calculate and draw trend line
@@ -2099,11 +2667,15 @@ class _WeightChartPainter extends CustomPainter {
       final startWeight = slope * 0 + intercept;
       final endWeight = slope * 6 + intercept;
 
-      final startY = size.height - ((startWeight - minWeight) / range * size.height);
-      final endY = size.height - ((endWeight - minWeight) / range * size.height);
+      final startY =
+          size.height - ((startWeight - minWeight) / range * size.height);
+      final endY =
+          size.height - ((endWeight - minWeight) / range * size.height);
 
       // Color based on direction (green = losing weight, red = gaining)
-      final trendColor = slope <= 0 ? Colors.green.shade400 : Colors.red.shade400;
+      final trendColor = slope <= 0
+          ? Colors.green.shade400
+          : Colors.red.shade400;
       final trendPaint = Paint()
         ..color = trendColor
         ..strokeWidth = 1.5
@@ -2179,4 +2751,132 @@ class _WeightChartPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
+}
+
+/// Custom painter for drawing an arc that's open at the bottom (horseshoe shape)
+class _ArcPainter extends CustomPainter {
+  final double progress;
+  final Color backgroundColor;
+  final Color progressColor;
+  final double strokeWidth;
+
+  _ArcPainter({
+    required this.progress,
+    required this.backgroundColor,
+    required this.progressColor,
+    required this.strokeWidth,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = Offset(size.width / 2, size.height / 2);
+    final radius = (size.width - strokeWidth) / 2;
+
+    // Arc spans 240 degrees (from 150° to 390°), leaving 120° open at bottom
+    const startAngle = 150 * pi / 180; // Start at bottom-left
+    const sweepAngle = 240 * pi / 180; // Sweep 240 degrees
+
+    final backgroundPaint = Paint()
+      ..color = backgroundColor
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = strokeWidth
+      ..strokeCap = StrokeCap.round;
+
+    final progressPaint = Paint()
+      ..color = progressColor
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = strokeWidth
+      ..strokeCap = StrokeCap.round;
+
+    // Draw background arc
+    canvas.drawArc(
+      Rect.fromCircle(center: center, radius: radius),
+      startAngle,
+      sweepAngle,
+      false,
+      backgroundPaint,
+    );
+
+    // Draw progress arc
+    if (progress > 0) {
+      canvas.drawArc(
+        Rect.fromCircle(center: center, radius: radius),
+        startAngle,
+        sweepAngle * progress,
+        false,
+        progressPaint,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _ArcPainter oldDelegate) {
+    return oldDelegate.progress != progress ||
+        oldDelegate.backgroundColor != backgroundColor ||
+        oldDelegate.progressColor != progressColor;
+  }
+}
+
+/// Custom painter for drawing a circular progress arc open at the bottom
+class _CircularProgressPainter extends CustomPainter {
+  final double progress;
+  final Color backgroundColor;
+  final Color progressColor;
+  final double strokeWidth;
+
+  _CircularProgressPainter({
+    required this.progress,
+    required this.backgroundColor,
+    required this.progressColor,
+    required this.strokeWidth,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = Offset(size.width / 2, size.height / 2);
+    final radius = (size.width - strokeWidth) / 2;
+
+    // Arc spans 240 degrees, leaving 120 degrees open at bottom
+    const startAngle = 150 * pi / 180; // Start at bottom-left
+    const sweepAngle = 240 * pi / 180; // Sweep 240 degrees
+
+    final backgroundPaint = Paint()
+      ..color = backgroundColor
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = strokeWidth
+      ..strokeCap = StrokeCap.round;
+
+    final progressPaint = Paint()
+      ..color = progressColor
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = strokeWidth
+      ..strokeCap = StrokeCap.round;
+
+    // Draw background arc
+    canvas.drawArc(
+      Rect.fromCircle(center: center, radius: radius),
+      startAngle,
+      sweepAngle,
+      false,
+      backgroundPaint,
+    );
+
+    // Draw progress arc (starting from left, going clockwise)
+    if (progress > 0) {
+      canvas.drawArc(
+        Rect.fromCircle(center: center, radius: radius),
+        startAngle,
+        sweepAngle * progress,
+        false,
+        progressPaint,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _CircularProgressPainter oldDelegate) {
+    return oldDelegate.progress != progress ||
+        oldDelegate.backgroundColor != backgroundColor ||
+        oldDelegate.progressColor != progressColor;
+  }
 }

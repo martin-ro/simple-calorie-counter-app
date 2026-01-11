@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../models/food_entry.dart';
+import 'app_card.dart';
 
 /// Displays a single food entry as a card in the list.
 ///
@@ -13,21 +14,12 @@ class FoodEntryCard extends StatelessWidget {
   /// Called when the user taps the delete button
   final VoidCallback onDelete;
 
-  const FoodEntryCard({
-    super.key,
-    required this.entry,
-    required this.onDelete,
-  });
+  const FoodEntryCard({super.key, required this.entry, required this.onDelete});
 
   @override
   Widget build(BuildContext context) {
-    return Card(
-      elevation: 0,
-      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(12),
-        side: BorderSide(color: Theme.of(context).dividerColor),
-      ),
+    return AppCard(
+      margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
       child: ListTile(
         // Food name on the left
         title: Text(

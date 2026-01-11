@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Test Barcode - Marmite</title>
+  <script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.6/dist/JsBarcode.all.min.js"></script>
+  <style>
+    body {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      background: white;
+    }
+    h1 { margin-bottom: 10px; }
+    p { color: #666; margin-bottom: 30px; }
+    svg { max-width: 90%; }
+  </style>
+</head>
+<body>
+  <h1>Marmite Yeast Extract</h1>
+  <p>Barcode: 50184453</p>
+  <svg id="barcode"></svg>
+  <script>
+    JsBarcode("#barcode", "50184453", {
+      format: "EAN8",
+      width: 3,
+      height: 150,
+      displayValue: true,
+      fontSize: 24
+    });
+  </script>
+</body>
+</html>

@@ -69,10 +69,20 @@ class _CalorieTrackerAppState extends State<CalorieTrackerApp> {
           themeMode: themeMode,
           theme: ThemeData(
             colorScheme: ColorScheme.fromSeed(
-              seedColor: const Color(0xFF00A6F4),
-              primary: const Color(0xFF00A6F4),
+              seedColor: const Color(0xFF3B82F6),
+              primary: const Color(0xFF3B82F6),
+              outline: Colors.grey.shade700,
             ),
             useMaterial3: true,
+            scaffoldBackgroundColor: const Color(0xFFF2F2F7),
+            appBarTheme: const AppBarTheme(
+              titleTextStyle: TextStyle(
+                fontSize: 20,
+                fontWeight: FontWeight.w500,
+                height: 1.0,
+                color: Colors.black,
+              ),
+            ),
             filledButtonTheme: FilledButtonThemeData(
               style: FilledButton.styleFrom(shape: buttonShape),
             ),
@@ -85,10 +95,19 @@ class _CalorieTrackerAppState extends State<CalorieTrackerApp> {
           ),
           darkTheme: ThemeData(
             colorScheme: ColorScheme.fromSeed(
-              seedColor: const Color(0xFF00A6F4),
+              seedColor: const Color(0xFF3B82F6),
               brightness: Brightness.dark,
+              outline: Colors.grey.shade400,
             ),
             useMaterial3: true,
+            appBarTheme: const AppBarTheme(
+              titleTextStyle: TextStyle(
+                fontSize: 20,
+                fontWeight: FontWeight.w500,
+                height: 1.0,
+                color: Colors.white,
+              ),
+            ),
             filledButtonTheme: FilledButtonThemeData(
               style: FilledButton.styleFrom(shape: buttonShape),
             ),

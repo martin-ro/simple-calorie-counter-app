@@ -107,10 +107,7 @@ class _AddFoodDialogState extends State<AddFoodDialog> {
           child: const Text('Cancel'),
         ),
         // Add button
-        FilledButton(
-          onPressed: _submit,
-          child: const Text('Add'),
-        ),
+        FilledButton(onPressed: _submit, child: const Text('Add')),
       ],
     );
   }

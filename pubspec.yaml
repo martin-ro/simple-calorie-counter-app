@@ -43,6 +43,13 @@ dependencies:
   # Meilisearch for food search
   meilisearch: ^0.17.0
 
+  # Health data integration (Health Connect / HealthKit)
+  health: ^13.2.1
+  permission_handler: ^11.3.1
+
+  # Barcode scanning
+  mobile_scanner: ^5.1.1
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

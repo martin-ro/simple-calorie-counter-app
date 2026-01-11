@@ -45,5 +45,11 @@
 	<true/>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>Camera access is needed to scan food barcodes</string>
+	<key>NSHealthShareUsageDescription</key>
+	<string>Simple Calorie Tracker needs access to your health data to display calories burned from your fitness devices and workouts.</string>
+	<key>NSHealthUpdateUsageDescription</key>
+	<string>Simple Calorie Tracker needs access to save health data.</string>
 </dict>
 </plist>

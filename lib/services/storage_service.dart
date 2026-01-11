@@ -40,6 +40,11 @@ class StorageService {
     return _userDoc?.collection('weights');
   }
 
+  /// Reference to the current user's exercise data collection.
+  CollectionReference? get _exerciseCollection {
+    return _userDoc?.collection('exercise');
+  }
+
   /// Saves a single food entry to Firestore.
   Future<void> saveEntry(FoodEntry entry) async {
     final collection = _entriesCollection;
@@ -152,5 +157,110 @@ class StorageService {
     if (collection == null) return;
 
     await collection.doc(id).delete();
+  }
+
+  // ==================== Exercise Data ====================
+
+  /// Formats a date as YYYY-MM-DD for use as document ID.
+  String _dateToId(DateTime date) {
+    return '${date.year}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
+  }
+
+  /// Saves exercise data for a specific date.
+  Future<void> saveExerciseData({
+    required DateTime date,
+    required int activeCalories,
+    required int basalCalories,
+  }) async {
+    final collection = _exerciseCollection;
+    if (collection == null) return;
+
+    final docId = _dateToId(date);
+    await collection.doc(docId).set({
+      'date': date.toIso8601String(),
+      'activeCalories': activeCalories,
+      'basalCalories': basalCalories,
+      'lastUpdated': DateTime.now().toIso8601String(),
+    });
+  }
+
+  /// Saves multiple exercise data entries in a batch.
+  Future<void> saveExerciseDataBatch(List<Map<String, dynamic>> entries) async {
+    final collection = _exerciseCollection;
+    if (collection == null) return;
+
+    final batch = _db.batch();
+    for (final entry in entries) {
+      final date = DateTime.parse(entry['date'] as String);
+      final docId = _dateToId(date);
+      batch.set(collection.doc(docId), {
+        ...entry,
+        'lastUpdated': DateTime.now().toIso8601String(),
+      });
+    }
+    await batch.commit();
+  }
+
+  /// Loads all exercise data from Firestore.
+  Future<Map<String, Map<String, dynamic>>> loadAllExerciseData() async {
+    final collection = _exerciseCollection;
+    if (collection == null) return {};
+
+    final snapshot = await collection.get();
+    final result = <String, Map<String, dynamic>>{};
+    for (final doc in snapshot.docs) {
+      result[doc.id] = doc.data() as Map<String, dynamic>;
+    }
+    return result;
+  }
+
+  /// Gets exercise data for a specific date.
+  Future<Map<String, dynamic>?> getExerciseForDate(DateTime date) async {
+    final collection = _exerciseCollection;
+    if (collection == null) return null;
+
+    final docId = _dateToId(date);
+    final doc = await collection.doc(docId).get();
+    if (!doc.exists) return null;
+    return doc.data() as Map<String, dynamic>?;
+  }
+
+  /// Gets the dates that have exercise data stored.
+  Future<Set<String>> getExerciseDates() async {
+    final collection = _exerciseCollection;
+    if (collection == null) return {};
+
+    final snapshot = await collection.get();
+    return snapshot.docs.map((doc) => doc.id).toSet();
+  }
+
+  // ==================== Budget History ====================
+
+  /// Reference to the current user's budget history collection.
+  CollectionReference? get _budgetHistoryCollection {
+    return _userDoc?.collection('budgetHistory');
+  }
+
+  /// Saves a budget entry effective from today.
+  Future<void> saveBudget(int calories) async {
+    final collection = _budgetHistoryCollection;
+    if (collection == null) return;
+
+    final dateKey = _dateToId(DateTime.now());
+    await collection.doc(dateKey).set({
+      'calorieBudget': calories,
+      'effectiveDate': dateKey,
+    });
+  }
+
+  /// Loads all budget history entries.
+  Future<List<Map<String, dynamic>>> loadBudgetHistory() async {
+    final collection = _budgetHistoryCollection;
+    if (collection == null) return [];
+
+    final snapshot = await collection.orderBy('effectiveDate', descending: true).get();
+    return snapshot.docs
+        .map((doc) => doc.data() as Map<String, dynamic>)
+        .toList();
   }
 }

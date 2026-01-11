@@ -7,8 +7,12 @@ A Flutter calorie tracking app with Firebase backend and Meilisearch for food se
 - Keep the UI simple and clean
 - Avoid using icons whenever possible - prefer text labels
 - Use white backgrounds for dialogs and cards
-- Cards should have no drop shadow (`elevation: 0`) and a subtle border (`Colors.grey.shade300`)
+- Follow Android Settings style:
+  - Cards: minimal elevation (1), corner radius 24dp, white background, no border
+  - NO dividers between items inside cards - use spacing only
+  - List items: 16dp horizontal padding, separated by whitespace
 - Modals/dialogs should be max width (use `insetPadding` and `SizedBox` with `MediaQuery`)
+- No pill-shaped buttons or tabs - use rectangular shapes with subtle rounded corners (max `BorderRadius.circular(8)`)
 
 ## Tech Stack
 
